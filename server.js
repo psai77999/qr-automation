@@ -1289,6 +1289,16 @@ app.get(
           req.params.eventId
       );
 
+console.log("QR ROUTE HIT");
+console.log("EVENT ID:", eventId);
+console.log("TOTAL ATTENDEES:", attendees.length);
+console.log(
+  "ATTENDEE EVENT IDS:",
+  db.attendees.map((a) => ({
+    id: a.id,
+    eventId: a.eventId
+  }))
+);
     const total =
       attendees.length;
 
