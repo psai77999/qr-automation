@@ -1357,3 +1357,10 @@ app.listen(
     console.log("");
   }
 );
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "https://alietsmartqrr.netlify.app"
+  ],
+  credentials: true
+}));
