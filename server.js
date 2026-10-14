@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const multer = require("multer");
 const jwt = require("jsonwebtoken");
 const QRCode = require("qrcode");
+const { Resend } = require("resend");
 
 dotenv.config();
 
@@ -1065,6 +1066,199 @@ app.post(
   }
 );
 
+/* ==========================================
+   SEND SECURE QR PASSES BY EMAIL
+========================================== */
+
+app.post(
+  "/api/events/:eventId/send-qr-emails",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+        return res.status(500).json({
+          success: false,
+          message: "Email service is not configured."
+        });
+      }
+
+      const resend = new Resend(process.env.RESEND_API_KEY);
+      const db = readDB();
+
+      const event = db.events.find(
+        (item) => item.id === req.params.eventId
+      );
+
+      if (!event) {
+        return res.status(404).json({
+          success: false,
+          message: "Event not found."
+        });
+      }
+
+      const attendees = db.attendees.filter(
+        (person) => person.eventId === event.id
+      );
+
+      if (!attendees.length) {
+        return res.status(400).json({
+          success: false,
+          message: "No attendees found for this event."
+        });
+      }
+
+      const results = {
+        total: attendees.length,
+        sent: 0,
+        failed: 0,
+        skipped: 0,
+        details: []
+      };
+
+      // Sequential sending avoids firing every email simultaneously.
+      for (const attendee of attendees) {
+        if (!attendee.email || !attendee.qrToken || !attendee.qrGenerated) {
+          attendee.emailStatus = "skipped";
+          attendee.emailStatusUpdatedAt = new Date().toISOString();
+
+          results.skipped++;
+          results.details.push({
+            attendeeId: attendee.id,
+            name: attendee.name,
+            status: "skipped",
+            reason: "Missing email or generated QR pass."
+          });
+
+          continue;
+        }
+
+        try {
+          // Build the QR image from this attendee's own signed token.
+          const qrDataUrl = await QRCode.toDataURL(
+            attendee.qrToken,
+            {
+              errorCorrectionLevel: "H",
+              margin: 2,
+              width: 500
+            }
+          );
+
+          const qrBase64 = qrDataUrl.split(",")[1];
+
+          const safeName = escapeEmailHtml(attendee.name);
+          const safeEvent = escapeEmailHtml(event.name);
+          const safeDate = escapeEmailHtml(event.date || "");
+          const safeLocation = escapeEmailHtml(event.location || "");
+
+          const { data, error } = await resend.emails.send({
+            from: process.env.EMAIL_FROM,
+            to: [attendee.email],
+            subject: `Your secure entry pass — ${event.name}`,
+            html: `
+              <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;color:#222">
+                <div style="background:#151515;color:white;padding:24px;border-radius:12px 12px 0 0">
+                  <p style="color:#f4c542;letter-spacing:2px;font-size:12px">
+                    ALIET TECHPRENEUR CLUB
+                  </p>
+                  <h1 style="margin-bottom:8px">Your Entry Pass</h1>
+                  <p style="color:#ddd;margin:0">${safeEvent}</p>
+                </div>
+
+                <div style="padding:24px;border:1px solid #eee;border-radius:0 0 12px 12px">
+                  <p>Hello <strong>${safeName}</strong>,</p>
+                  <p>Your secure QR entry pass is ready. Please show the QR code below to an authorized volunteer at the event.</p>
+
+                  <div style="text-align:center;padding:18px">
+                    <img
+                      src="cid:attendee-qr"
+                      alt="Your secure event QR pass"
+                      width="260"
+                      height="260"
+                      style="max-width:100%;height:auto"
+                    />
+                  </div>
+
+                  <p><strong>Event:</strong> ${safeEvent}</p>
+                  ${safeDate ? `<p><strong>Date:</strong> ${safeDate}</p>` : ""}
+                  ${safeLocation ? `<p><strong>Venue:</strong> ${safeLocation}</p>` : ""}
+
+                  <p style="font-size:13px;color:#666">
+                    This pass is assigned to you. Do not share your QR code with others.
+                  </p>
+                  <hr style="border:none;border-top:1px solid #eee" />
+                  <p style="font-size:12px;color:#888">ALIET Techpreneur Club · Smart QR Attendance</p>
+                </div>
+              </div>
+            `,
+            attachments: [
+              {
+                filename: "secure-entry-pass.png",
+                content: qrBase64,
+                contentType: "image/png",
+                contentId: "attendee-qr"
+              }
+            ]
+          });
+
+          if (error) {
+            throw new Error(error.message || "Email provider rejected the message.");
+          }
+
+          attendee.emailStatus = "sent";
+          attendee.emailSentAt = new Date().toISOString();
+          attendee.emailProviderId = data?.id || null;
+          attendee.emailStatusUpdatedAt = new Date().toISOString();
+
+          results.sent++;
+          results.details.push({
+            attendeeId: attendee.id,
+            name: attendee.name,
+            status: "sent"
+          });
+        } catch (emailError) {
+          console.error(
+            "QR EMAIL FAILED:",
+            attendee.id,
+            emailError.message
+          );
+
+          attendee.emailStatus = "failed";
+          attendee.emailStatusUpdatedAt = new Date().toISOString();
+
+          results.failed++;
+          results.details.push({
+            attendeeId: attendee.id,
+            name: attendee.name,
+            status: "failed",
+            reason: emailError.message || "Email delivery request failed."
+          });
+        }
+
+        // Save status after each attendee so a later failure doesn't
+        // erase the progress already recorded by this request.
+        writeDB(db);
+      }
+
+      return res.json({
+        success: true,
+        message: "QR email dispatch finished.",
+        eventId: event.id,
+        eventName: event.name,
+        results
+      });
+    } catch (error) {
+      console.error("QR EMAIL ROUTE ERROR:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to process QR email dispatch."
+      });
+    }
+  }
+);
+
+
 
 // ==================================================
 // DEVELOPMENT QR TOKEN HELPER
@@ -1331,6 +1525,167 @@ console.log(
   }
 );
 
+app.post(
+  "/api/events/:eventId/send-qr-emails",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const apiKey = process.env.RESEND_API_KEY;
+      const emailFrom = process.env.EMAIL_FROM;
+
+      if (!apiKey || !emailFrom) {
+        return res.status(500).json({
+          error: "Email service is not configured on the server."
+        });
+      }
+
+      const { eventId } = req.params;
+      const db = readDB();
+
+      const event = db.events.find(
+        (item) => item.id === eventId
+      );
+
+      if (!event) {
+        return res.status(404).json({
+          error: "Event not found"
+        });
+      }
+
+      const attendees = db.attendees.filter(
+        (person) => person.eventId === eventId
+      );
+
+      if (attendees.length === 0) {
+        return res.status(400).json({
+          error: "No attendees found for this event"
+        });
+      }
+
+      let sent = 0;
+      let failed = 0;
+      let skipped = 0;
+
+      for (const attendee of attendees) {
+        // Skip emails already recorded as sent.
+        if (attendee.emailStatus === "sent") {
+          skipped++;
+          continue;
+        }
+
+        if (
+          !attendee.email ||
+          !attendee.qrDataUrl ||
+          !attendee.qrGenerated
+        ) {
+          attendee.emailStatus = "failed";
+          attendee.emailError =
+            "Missing email or generated QR code";
+          failed++;
+          continue;
+        }
+
+        try {
+          const match = attendee.qrDataUrl.match(
+            /^data:image\/png;base64,(.+)$/
+          );
+
+          if (!match) {
+            throw new Error("QR image is not a valid PNG data URL");
+          }
+
+          const eventName =
+            event.name || event.title || "ALIET Event";
+
+          const response = await fetch(
+            "https://api.resend.com/emails",
+            {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${apiKey}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                from: emailFrom,
+                to: [attendee.email],
+                subject: `Your QR Attendance Pass — ${eventName}`,
+                html: `
+                  <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:24px">
+                    <h2>Your Event Attendance Pass</h2>
+                    <p>Hello ${escapeEmailHtml(attendee.name || "Attendee")},</p>
+                    <p>Your QR attendance pass for
+                    <strong>${escapeEmailHtml(eventName)}</strong>
+                    is attached to this email.</p>
+                    <p>Please keep this pass private and show it
+                    to an authorized volunteer at check-in.</p>
+                    <p>Thank you,<br/>ALIET Smart QR Attendance</p>
+                  </div>
+                `,
+                attachments: [
+                  {
+                    filename: "attendance-qr.png",
+                    content: match[1]
+                  }
+                ]
+              })
+            }
+          );
+
+          const result = await response.json();
+
+          if (!response.ok) {
+            throw new Error(
+              result.message || result.name || "Email provider rejected the request"
+            );
+          }
+
+          attendee.emailStatus = "sent";
+          attendee.emailSentAt = new Date().toISOString();
+          attendee.emailError = null;
+          attendee.emailProviderId = result.id || null;
+          sent++;
+        } catch (error) {
+          attendee.emailStatus = "failed";
+          attendee.emailError = String(error.message || error).slice(0, 300);
+          failed++;
+        }
+
+        // Save each result so progress is not lost if a later send fails.
+        writeDB(db);
+      }
+
+      writeDB(db);
+
+      return res.json({
+        message: "Email sending process completed",
+        eventId,
+        total: attendees.length,
+        sent,
+        failed,
+        skipped
+      });
+    } catch (error) {
+      console.error("QR email automation error:", error);
+
+      return res.status(500).json({
+        error: "Failed to process QR emails"
+      });
+    }
+  }
+);
+
+// Keep this helper outside the route, at file scope.
+function escapeEmailHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[character]);
+}
+
 
 // ==================================================
 // START SERVER
@@ -1367,6 +1722,140 @@ app.listen(
     console.log("");
   }
 );
+
+app.post(
+  "/api/events/:eventId/send-qr-emails",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (
+        !process.env.RESEND_API_KEY ||
+        !process.env.EMAIL_FROM
+      ) {
+        return res.status(500).json({
+          success: false,
+          message: "Email environment variables are missing."
+        });
+      }
+
+      const resend = new Resend(
+        process.env.RESEND_API_KEY
+      );
+
+      const db = readDB();
+
+      const event = db.events.find(
+        (item) => item.id === req.params.eventId
+      );
+
+      if (!event) {
+        return res.status(404).json({
+          success: false,
+          message: "Event not found."
+        });
+      }
+
+      const attendees = db.attendees.filter(
+        (item) => item.eventId === event.id
+      );
+
+      if (attendees.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "No attendees found."
+        });
+      }
+
+      let sent = 0;
+      let failed = 0;
+      let skipped = 0;
+
+      for (const attendee of attendees) {
+        if (!attendee.email || !attendee.qrToken) {
+          skipped++;
+          continue;
+        }
+
+        try {
+          const qrBuffer = await QRCode.toBuffer(
+            attendee.qrToken,
+            {
+              errorCorrectionLevel: "H",
+              margin: 2,
+              width: 500
+            }
+          );
+
+          const result = await resend.emails.send({
+            from: process.env.EMAIL_FROM,
+            to: [attendee.email],
+            subject: `Your Secure Entry Pass — ${event.name}`,
+            html: `
+              <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;padding:24px;color:#222">
+                <h2>ALIET Techpreneur Club</h2>
+                <h3>${String(event.name || "Event")
+                  .replace(/&/g, "&amp;")
+                  .replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;")}</h3>
+                <p>Hello ${String(attendee.name || "Attendee")
+                  .replace(/&/g, "&amp;")
+                  .replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;")},</p>
+                <p>Your secure entry QR pass is attached to this email.</p>
+                <p>Please keep the QR code ready for scanning at event entry.</p>
+                <p>Regards,<br>ALIET Techpreneur Club</p>
+              </div>
+            `,
+            attachments: [
+              {
+                filename: "secure-entry-pass.png",
+                content: qrBuffer.toString("base64"),
+                contentType: "image/png"
+              }
+            ]
+          });
+
+          if (result.error) {
+            throw new Error(result.error.message);
+          }
+
+          attendee.emailStatus = "sent";
+          attendee.emailSentAt = new Date().toISOString();
+          sent++;
+        } catch (error) {
+          console.error(
+            "QR email failed for:",
+            attendee.email,
+            error.message
+          );
+
+          attendee.emailStatus = "failed";
+          failed++;
+        }
+
+        // Save progress after each attendee.
+        writeDB(db);
+      }
+
+      return res.json({
+        success: true,
+        message: "QR email process completed.",
+        sent,
+        failed,
+        skipped
+      });
+    } catch (error) {
+      console.error("QR email route error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to process QR emails."
+      });
+    }
+  }
+);
+
 app.use(cors({
   origin: [
     "http://localhost:5173",
@@ -1374,3 +1863,12 @@ app.use(cors({
   ],
   credentials: true
 }));
+function escapeEmailHtml(value = "") {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[char]));
+}
